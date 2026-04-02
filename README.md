@@ -1,4 +1,4 @@
-# Performance Analysis of Model Training
+# Rooflines on NVIDIA GPUs
 
 * Experiment with performance profilers (NVIDIA Nsight Compute).
 * Train ResNet18 and ResNet34 on CIFAR-10.
@@ -113,7 +113,7 @@ python3 plot_roofline.py \
   --out resnet18_bs128_L4.png
 ```
 
-## <a id="directory"></a> 📁 Directory
+## <a id="directory"></a> 🗂️ Directory
 ```
 nn-perf/
 ├─ train.py
