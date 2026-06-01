@@ -13,7 +13,7 @@ CIFAR10_STD  = (0.2023, 0.1994, 0.2010)
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-def set_seed(seed: int):
+def set_random_seed(seed: int):
     random.seed(seed)                           # seeds Python's built-in RNG
     torch.manual_seed(seed)                     # seeds PyTorch CPU RNG
     torch.cuda.manual_seed_all(seed)            # seeds CUDA RNG
@@ -24,42 +24,37 @@ def set_seed(seed: int):
 
 def log_device_info(device: torch.device, amp_flag: bool):
     """
-    Print summary of runtime environment and accelerator
-    """
-    
-    print(f"[env] torch={torch.__version__}")
-    
-    try:
-        print(f"[env] numpy={_np.__version__}")
-    except Exception:
-        print("[env] numpy=NOT INSTALLED")
-    
-    """
-    NVIDIA GPU → prints CUDA info and whether AMP is on.
+    Print summary of runtime environment and available accelerator
+
+    NVIDIA GPU → prints CUDA info and whether AMP is enabled.
     Apple Silicon Mac → prints MPS info and notes AMP is disabled.
     Otherwise → CPU.
 
     MPS (Metal Performance Shader) : Apple's GPU backend
     AMP (Automatic Mixed Precision) : Use mixed precision to speed up math and reduce GPU memory
     """
+    print(f"[env] torch={torch.__version__}")
+    
+    try:
+        print(f"[env] numpy={_np.__version__}")
+    except Exception:
+        print("[env] numpy=NOT INSTALLED")
 
     if device.type == "cuda":
         n = torch.cuda.device_count()
         name = torch.cuda.get_device_name(0)
         print(f"[device] CUDA available: True | gpus={n} | current='{name}'")
         print(f"[amp] enabled={amp_flag}")
-    
     elif device.type == "mps":
         print("[device] MPS (Apple Silicon) available: True | using MPS device")
         print("[amp] disabled on MPS (float32 training)")
-    
     else:
         print("[device] CPU")
         print("[amp] disabled on CPU")
 
 def get_device():
     """
-    decides which accelerator to use, in order of preference
+    Decides which accelerator to use, in order of preference
     """
     if torch.cuda.is_available():
         dev = torch.device("cuda")
@@ -76,7 +71,6 @@ def make_loaders(data_dir, batch_size, workers, pin_memory: bool):
     """
     Builds training & test DataLoaders; how data is transformed, batched, and fed to the GPU/CPU.
     """
-
     tf_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -108,9 +102,13 @@ def make_loaders(data_dir, batch_size, workers, pin_memory: bool):
 
 def accuracy(logits, y):
     """
-    Top-1 accuracy helper; compare the predicted class with ground-truth label.
-    Logits if of shape [# batch, # class], y id of shape [# batch].
-    Returns [# batch] tensor of booleans.
+    Top-1 accuracy helper used for reporting performance.
+    This is separate from the loss function that drives learning.
+
+    logits has shape [batch, classes] and stores one score per class for each example.
+    y has shape [batch] and stores the true class ID for each example.
+
+    Returns the fraction of correct predictions in the batch.
     """
     return (logits.argmax(1) == y).float().mean().item()
  
@@ -143,6 +141,21 @@ def load_ckpt(path, model, opt=None, sched=None, map_location="cpu"):
     return blob.get("epoch", 0), blob.get("best_acc", 0.0)
 
 # ---- NVTX helpers (no-ops when not on CUDA) ----
+"""
+    Use NVTX to profle one training step
+    * Profile GPU work inside the NVTX window (matmul/conv, fused ops, optimizer kernels)
+    * Attribution to sub-ranges (“forward”, “backward”, etc.)
+    * Bounded to one batch thanks to warmup + syncs + early exit
+
+    Using NVTX
+    * nvtx push/pop labels “start/stop” markers on the host timeline.
+    * nvtx.range_push("name") tells the profiler “start a region called name now.”
+    * nvtx.range_pop() says “end the most recent region.”
+
+    They’re annotations that Nsight tools read later to:
+    * Align your labeled regions with actual CUDA kernel launches (which are async).
+    * Let you filter and attribute metrics to specific phases (forward/backward/opt).
+"""
 def _nvtx_push(name: str, enabled: bool):
     if enabled:
         torch.cuda.nvtx.range_push(name)
@@ -156,16 +169,15 @@ def _cuda_sync(enabled: bool):
         torch.cuda.synchronize()
 
 def main(args):
-    set_seed(args.seed)
-    
+    set_random_seed(args.seed)
     device = get_device()
     use_cuda = (device.type == "cuda")    # are we on NVIDIA?
-    amp_on = args.amp and use_cuda        # are we on AMP?
-    pin_mem = use_cuda                    # pin_memory - only helps on CUDA
-    profiling_enabled = bool(args.profile_one_step) and use_cuda  # NVTX+sync only on CUDA
-    
+    amp_on = args.amp and use_cuda        # use AMP?
+    pin_mem = use_cuda                    # pin_memory, only helps on CUDA
+    profiling_enabled = bool(args.profile_one_step) and use_cuda
     log_device_info(device, amp_on)
 
+    # DataLoaders
     train_dl, test_dl = make_loaders(args.data, args.batch_size, args.workers, pin_mem)
 
     # Model
@@ -184,26 +196,35 @@ def main(args):
     warmup = max(0, args.warmup)
     total_steps = args.epochs * math.ceil(len(train_dl.dataset) / args.batch_size)
     
+    # Learning rate multiplier
     def lr_lambda(step):
         if step < warmup:
             return (step + 1) / max(1, warmup)
         t = (step - warmup) / max(1, total_steps - warmup)
         return 0.5 * (1 + math.cos(math.pi * t))
     
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)     # learning rate scheduler - automatically changes the optimizer's lr during training
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)     # learning rate scheduler, automatically changes the optimizer's lr during training
     loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)     # loss function
 
-    # New AMP API (CUDA only)
+    # Scaler helps training stay numerically stable when using lower-precision math.
+    # With AMP, some values can become very small and gradients can underflow.
+    # The scaler temporarily multiplies the loss by a large factor before backprop.
+    # This makes the gradients larger too, so they are less likely to underflow in lower precision.
+    # Before the optimizer update, PyTorch divides those gradients back down to their original scale.
     scaler = torch.amp.GradScaler("cuda", enabled=amp_on) if use_cuda else None
+    
+    # Context manager that turns mixed precision on for the forward pass.
+    # Outside the "with autocast" block, normal precision rules apply.
+    # Inside the block, PyTorch can run some operations in lower precision
+    # when it is supported and safe to do so.
     autocast_ctx = (lambda: torch.amp.autocast("cuda", enabled=amp_on)) if use_cuda else (lambda: nullcontext())
 
     start_epoch, best_acc = 0, 0.0
+
     if args.resume and os.path.isfile(args.resume):
         start_epoch, best_acc = load_ckpt(args.resume, model, opt, sched, map_location="cpu")
         print(f"[resume] from {args.resume} at epoch {start_epoch}, best_acc={best_acc:.3f}")
 
-    # Warmup/profiling controls
-    # Warmup lets cuDNN autotune, caches get populated, memory pools settle, JIT/fusions kick in—so the later profiled step reflects steady-state kernels/timings.
     warmup_iters = max(0, args.warmup_iters)    # how many iterations to run before profiling starts.
     profile_iter = max(1, args.profile_iter)    # which single iteration after warmup to profile (1 = the first one after warmup).
     did_profile = False                         # a boolean flag indicating whether the script actually profiled that one step (used to exit early and skip eval).
@@ -226,22 +247,6 @@ def main(args):
 
             if profiling_enabled and it == 1:
                 print(f"[profile] warmup iters={warmup_iters}, profiling iter={warmup_iters + profile_iter} (1-based within epoch)")
-            
-            """
-            Use NVTX to profle one training step
-            - Profile GPU work inside the NVTX window (matmul/conv, fused ops, optimizer kernels)
-            - Attribution to sub-ranges (“forward”, “backward”, etc.)
-            - Bounded to one batch thanks to warmup + syncs + early exit
-
-            Using NVTX
-            nvtx push/pop labels “start/stop” markers on the host timeline.
-            nvtx.range_push("name") tells the profiler “start a region called name now.”
-            nvtx.range_pop() says “end the most recent region.”
-
-            They’re annotations that Nsight tools read later to:
-            Align your labeled regions with actual CUDA kernel launches (which are async).
-            Let you filter and attribute metrics to specific phases (forward/backward/opt).
-            """
             
             if profile_this_step:
                 _cuda_sync(True) # torch.cuda.synchronize() ensures your “end” truly captures all GPU work inside the range (CUDA is async by default).

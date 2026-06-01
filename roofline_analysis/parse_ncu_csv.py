@@ -1,11 +1,25 @@
-#!/usr/bin/env python3
 import argparse
 import math
 import numpy as np
 import pandas as pd
 
 """
-Parse the csv file extracted from the ncu report, generate a summary
+Parse an Nsight Compute CSV export and generate a text summary.
+
+This script aggregates per-kernel profiler rows into step-level totals and
+derived metrics that are useful for roofline analysis, including:
+- total floating-point operations
+- total DRAM traffic
+- achieved GFLOP/s
+- achieved GB/s
+- arithmetic intensity
+- time-weighted SM and DRAM utilization
+
+Typical usage:
+    ncu --import report.ncu-rep --csv > report.csv
+    python3 roofline_analysis/parse_ncu_csv.py report.csv \
+        --label resnet18_bs128_L4 \
+        --out summary.txt
 """
 
 METRIC_SM   = "sm__throughput.avg.pct_of_peak_sustained_elapsed"
@@ -20,7 +34,12 @@ METRIC_DRAM_READ  = "dram__bytes_read.sum"
 METRIC_DRAM_WRITE = "dram__bytes_write.sum"
 
 def to_float(v):
-    """Convert Metric Value cell to float; strip % and thousands separators."""
+    """
+    Normalize a profiler-provided metric string and convert it to float.
+
+    Nsight Compute may format values with percent signs or thousands
+    separators, so this helper strips those decorations first.
+    """
     try:
         s = str(v).strip().replace("%", "").replace(",", "")
         return float(s)
@@ -28,43 +47,43 @@ def to_float(v):
         return np.nan
 
 def detect_time_scale(unit_raw: str) -> float:
-    """Map time unit to seconds scaling factor."""
+    """
+    Map time unit to seconds scaling factor.
+    """
     u = (unit_raw or "").strip().lower()
 
     if u in {"usecond", "us", "µs", "microsecond", "microseconds"}:
         return 1e-6
-    
     if u in {"ms", "millisecond", "milliseconds"}:
         return 1e-3
-    
     if u in {"ns", "nanosecond", "nanoseconds"}:
         return 1e-9
-    
     if u in {"s", "sec", "second", "seconds"}:
         return 1.0
 
     return 1e-6
 
 def detect_bytes_scale(unit_raw: str) -> float:
-    """Map byte units (byte, Kbyte, Mbyte, etc.) to bytes."""
+    """
+    Map byte units (byte, Kbyte, Mbyte, etc.) to bytes.
+    """
     u = (unit_raw or "").strip().lower()
 
     if u in {"byte", "bytes"}:
         return 1.0
-    
     if u in {"kbyte", "kbytes", "kb"}:
         return 1024.0
-    
     if u in {"mbyte", "mbytes", "mb"}:
         return 1024.0 ** 2
-    
     if u in {"gbyte", "gbytes", "gb"}:
         return 1024.0 ** 3
 
     return 1.0
 
 def build_join_keys(df: pd.DataFrame):
-    """Columns that identify a kernel instance."""
+    """
+    Columns that identify a kernel instance.
+    """
     candidates = ["Kernel Name", "Context", "Stream", "Block Size", "Grid Size", "Device", "CC"]
     
     return [c for c in candidates if c in df.columns]
@@ -72,8 +91,13 @@ def build_join_keys(df: pd.DataFrame):
 def weighted_avg_pct(df: pd.DataFrame, metric_name: str, join_keys):
     """
     Time-weighted average of a percentage metric over kernels.
-    Weight = gpu__time_duration.sum for that kernel.
+
+    Each kernel contributes in proportion to how long it ran.
+    This is more representative than a plain average because short-lived
+    kernels should not influence the final utilization as much as kernels
+    that dominate the profiled step.
     """
+
     # Metric values
     sub = df[df["Metric Name"] == metric_name][join_keys + ["Metric Value"]].copy()
     
@@ -103,7 +127,9 @@ def weighted_avg_pct(df: pd.DataFrame, metric_name: str, join_keys):
     return float((merged["metric"] * merged["time_val"]).sum() / merged["time_val"].sum())
 
 def sum_step_time_seconds(df: pd.DataFrame) -> float:
-    """Sum gpu__time_duration.sum over kernels, converted to seconds."""
+    """
+    Sum gpu__time_duration.sum over kernels, converted to seconds.
+    """
     tdf = df[df["Metric Name"] == METRIC_TIME].copy()
     
     if tdf.empty:
@@ -113,7 +139,12 @@ def sum_step_time_seconds(df: pd.DataFrame) -> float:
         "Unit" if "Unit" in tdf.columns else None
     )
     
-    unit_mode = tdf[unit_col].mode().iat[0] if unit_col else "usecond"
+    if unit_col:
+        unit_values = tdf[unit_col].dropna()
+        unit_mode = unit_values.mode().iat[0] if not unit_values.empty else "usecond"
+    else:
+        unit_mode = "usecond"
+
     scale = detect_time_scale(unit_mode)
 
     tdf = tdf.rename(columns={"Metric Value": "time_val"})
@@ -126,7 +157,9 @@ def sum_step_time_seconds(df: pd.DataFrame) -> float:
     return step_time_s
 
 def sum_metric(df: pd.DataFrame, metric_name: str) -> float:
-    """Sum Metric Value over all rows for a given metric (no unit scaling)."""
+    """
+    Sum Metric Value over all rows for a given metric (no unit scaling).
+    """
     sub = df[df["Metric Name"] == metric_name].copy()
     
     if sub.empty:
@@ -138,13 +171,18 @@ def sum_metric(df: pd.DataFrame, metric_name: str) -> float:
     return float(vals.sum())
 
 def sum_bytes_metric(df: pd.DataFrame, metric_name: str) -> float:
-    """Sum byte-type metrics, respecting Metric Unit, into raw bytes."""
+    """
+    Sum byte-type metrics, respecting Metric Unit, into raw bytes.
+    """
     sub = df[df["Metric Name"] == metric_name].copy()
     
     if sub.empty:
         return 0.0
 
     total = 0.0
+    unit_col = "Metric Unit" if "Metric Unit" in sub.columns else (
+        "Unit" if "Unit" in sub.columns else None
+    )
     
     for _, row in sub.iterrows():
         val = to_float(row["Metric Value"])
@@ -152,7 +190,8 @@ def sum_bytes_metric(df: pd.DataFrame, metric_name: str) -> float:
         if np.isnan(val):
             continue
         
-        scale = detect_bytes_scale(row.get("Metric Unit", "byte"))
+        unit_raw = row.get(unit_col, "byte") if unit_col else "byte"
+        scale = detect_bytes_scale(unit_raw)
         total += val * scale
     
     return float(total)
@@ -183,6 +222,8 @@ def main():
     step_time_s = sum_step_time_seconds(df)
 
     # 3) FLOP operation counts
+    # One FFMA instruction performs both a multiply and an add, so it
+    # contributes 2 floating-point operations.
     fadd_total = sum_metric(df, METRIC_FADD)
     fmul_total = sum_metric(df, METRIC_FMUL)
     ffma_total = sum_metric(df, METRIC_FFMA)
@@ -211,7 +252,7 @@ def main():
         f.write(f"Label: {args.label}\n")
         f.write(f"Input CSV: {args.csv}\n\n")
 
-        f.write("=== Totals (per profiled step) ===\n")
+        f.write("=== Totals (aggregated across all kernels in the profiled step) ===\n")
         f.write(f"Total fadd instructions : {fadd_total:.3e}\n")
         f.write(f"Total fmul instructions : {fmul_total:.3e}\n")
         f.write(f"Total ffma instructions : {ffma_total:.3e}\n")
