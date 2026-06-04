@@ -4,7 +4,7 @@
   <img src="roofline_analysis/img/a1_resnet18_bs64_L4.png" width="500" />
 </div>
 
-In this project, we use [roofline analysis](https://en.wikipedia.org/wiki/Roofline_model) to characterize neural network training workloads are limited by memory bandwidth or compute throughput. We analyze the training of ResNet-18 and ResNet-34 on CIFAR-10 by collecting GPU kernel-level metrics with NVIDIA Nsight Compute (`ncu`). The resulting `.ncu-rep` output is exported to CSV and processed to obtain FLOP/s and arithmetic intensity, which are finally visualized as roofline plots.
+In this project, we use [roofline analysis](https://en.wikipedia.org/wiki/Roofline_model) to characterize whether neural network training workloads are limited by memory bandwidth or compute throughput. We analyze the training of ResNet-18 and ResNet-34 on CIFAR-10 by collecting GPU kernel-level metrics with NVIDIA Nsight Compute (`ncu`). The resulting `.ncu-rep` output is exported to CSV and processed to obtain FLOP/s and arithmetic intensity, which are finally visualized as roofline plots.
 
 Learn more about this project in [this blog article](https://taytwkim.vercel.app/blog/projects/001-roofline/).
 
